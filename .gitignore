@@ -1,0 +1,15 @@
+# Betriebssystem-Kram
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Test- und Debug-Artefakte
+_test.html
+_selftest.html
+debug*.html

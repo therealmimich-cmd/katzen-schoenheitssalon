@@ -1,0 +1,1584 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Katzen-Schönheitssalon 🐱</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#120e19;overflow:hidden;
+    font-family:"Trebuchet MS",Verdana,sans-serif;user-select:none;-webkit-user-select:none;
+    -webkit-tap-highlight-color:transparent;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;touch-action:none;background:#2a2233;border-radius:12px;
+    box-shadow:0 12px 44px rgba(0,0,0,.65);cursor:pointer;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="640"></canvas></div>
+<script>
+(function(){
+'use strict';
+
+/* ============================================================
+   KATZEN-SCHÖNHEITSSALON
+   Ein 2D-Browserspiel: Wasche, kämme, füttere die Katze und
+   schneide ihr die Krallen – in Badezimmer, Schlafzimmer, Wohnzimmer.
+   ============================================================ */
+
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var W = 960, H = 640;
+var TAU = Math.PI * 2;
+
+function resize(){
+  var s = Math.min((window.innerWidth - 12) / W, (window.innerHeight - 12) / H);
+  canvas.style.width  = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------------- kleine Helfer ---------------- */
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function rgb(c){ return 'rgb('+Math.round(c[0])+','+Math.round(c[1])+','+Math.round(c[2])+')'; }
+function mixArr(a,b,t){ return [lerp(a[0],b[0],t),lerp(a[1],b[1],t),lerp(a[2],b[2],t)]; }
+function rgbLerp(a,b,t){ return rgb(mixArr(a,b,t)); }
+function rr(x,y,w,h,r){
+  r = Math.min(r, Math.abs(w)/2, Math.abs(h)/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+function circ(x,y,r){ ctx.beginPath(); ctx.arc(x,y,r,0,TAU); }
+function ell(x,y,rx,ry,rot){ ctx.beginPath(); ctx.ellipse(x,y,rx,ry,rot||0,0,TAU); }
+function txt(s,x,y,size,color,align,bold){
+  ctx.font = (bold?'bold ':'')+size+'px "Trebuchet MS",Verdana,sans-serif';
+  ctx.fillStyle = color; ctx.textAlign = align||'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(s,x,y);
+}
+function shadow(x,y,r,a){
+  ctx.save(); ctx.scale(1,0.3);
+  circ(x, y/0.3, r);
+  ctx.fillStyle = 'rgba(0,0,0,'+a+')'; ctx.fill();
+  ctx.restore();
+}
+
+/* ---------------- Sound (winzig, per WebAudio) ---------------- */
+var actx=null, muted=false;
+function ensureAudio(){
+  if(actx) return;
+  try{ actx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ actx=null; }
+}
+function tone(freq,dur,type,vol,slideTo){
+  if(muted) return;
+  var a = actx; if(!a) return;
+  try{
+    var o=a.createOscillator(), g=a.createGain();
+    o.type = type||'sine';
+    o.frequency.setValueAtTime(freq, a.currentTime);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime+dur);
+    g.gain.setValueAtTime(0.0001, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(vol||0.07, a.currentTime+0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime+dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime+dur+0.03);
+  }catch(e){}
+}
+function sfxMeow(){ tone(640,0.16,'sawtooth',0.045,880); setTimeout(function(){ tone(900,0.22,'sawtooth',0.04,560); },150); }
+function sfxPop(){ tone(560,0.09,'triangle',0.05,900); }
+function sfxClean(){ tone(1200,0.08,'square',0.03,1700); }
+function sfxWin(){ [523,659,784,1047].forEach(function(f,i){ setTimeout(function(){ tone(f,0.32,'sine',0.06); }, i*140); }); }
+
+/* ---------------- Spielzustand ---------------- */
+var game = {
+  wash:0, brush:0, feed:0, claw:0,     // Fortschritt 0..1
+  teeth:0, play:0, nap:0,              // drei weitere Pflege-Aufgaben
+  fed:false, sleeping:false,
+  won:false, wonAt:0, winAck:false,
+  startTime:0,
+  hearts:0, petCount:0,
+  particles:[]
+};
+
+var roomId = 'bathroom';
+var roomOrder = ['bathroom','living','bedroom'];
+var sleeping = false;
+
+var cat = { x:680, y:550, tx:680, ty:550, scale:0.8, tail:0, walkT:0,
+            grabbed:false, inTub:false, blink:0, blinkTimer:2 };
+
+var ITEM_DEFS = {
+  soap:    { kind:'soap',    room:'bathroom', x:185, y:522, label:'Duschgel',   icon:'🧴' },
+  comb:    { kind:'comb',    room:'bathroom', x:95,  y:528, label:'Kamm',       icon:'🪮' },
+  scissor: { kind:'scissor', room:'bathroom', x:278, y:522, label:'Schere',     icon:'✂️' },
+  brush2:  { kind:'brush2',  room:'bathroom', x:372, y:524, label:'Zahnbürste', icon:'🪥' },
+  ball:    { kind:'ball',    room:'living',   x:742, y:524, label:'Spielball',  icon:'🧶' },
+  food:    { kind:'food',    room:'living',   x:862, y:520, label:'Futter',     icon:'🍗' },
+  pillow:  { kind:'pillow',  room:'bedroom',  x:790, y:518, label:'Kissen',     icon:'💤' }
+};
+var items = {};
+for(var key in ITEM_DEFS){
+  items[key] = Object.assign({}, ITEM_DEFS[key]);
+  items[key].homeX = ITEM_DEFS[key].x;
+  items[key].homeY = ITEM_DEFS[key].y;
+  items[key].carried = false;
+}
+
+var CAT_SPOTS = {
+  bathroom:{ x:680, y:550 },
+  living:  { x:660, y:545 },
+  bedroom: { x:700, y:545 }
+};
+var ROOM_NAMES = { bathroom:'Badezimmer', living:'Wohnzimmer', bedroom:'Schlafzimmer' };
+
+var TASKS = [
+  { id:'wash',  icon:'🛁', label:'Waschen',    short:'Waschen' },
+  { id:'brush', icon:'🪮', label:'Kämmen',     short:'Kämmen' },
+  { id:'claw',  icon:'✂️', label:'Krallen',    short:'Krallen' },
+  { id:'teeth', icon:'🪥', label:'Zähne',      short:'Zähne' },
+  { id:'feed',  icon:'🍗', label:'Füttern',    short:'Füttern' },
+  { id:'play',  icon:'🧶', label:'Spielen',    short:'Spielen' },
+  { id:'nap',   icon:'💤', label:'Schlafen',   short:'Schlafen' }
+];
+function prog(id){ return game[id]; }
+
+var drag = null;
+var selectedKind = null;
+var uiButtons = [];
+
+var msg = '', msgTimer = 0;
+function say(t, dur){ msg = t; msgTimer = dur || 2.6; }
+
+var showTutorial = true;
+var showWin = false;
+
+/* ---------------- Raum wechseln ---------------- */
+function enterRoom(id){
+  roomId = id;
+  cat.inTub = false;
+  cat.tx = CAT_SPOTS[id].x; cat.ty = CAT_SPOTS[id].y;
+  cat.x = cat.tx; cat.y = cat.ty;      /* beim Raumwechsel sofort an den Platz setzen */
+  cat.grabbed = false;
+  for(var k in items){
+    if(items[k].room === id){ items[k].x = items[k].homeX; items[k].y = items[k].homeY; }
+    items[k].carried = false;
+  }
+  selectedKind = null;
+  drag = null;
+  if(sleeping){ sleeping = false; }
+  tone(400,0.08,'sine',0.04,600);
+}
+
+/* ---------------- Fortschritt ---------------- */
+function complete(text){
+  burst(cat.x, cat.y-90, 'star', 22);
+  say(text, 3.0);
+  tone(880,0.18,'sine',0.06,1200);
+}
+function allDone(){
+  return game.wash>=1 && game.brush>=1 && game.feed>=1 && game.claw>=1 &&
+         game.teeth>=1 && game.play>=1 && game.nap>=1;
+}
+function doneCount(){
+  var n = 0;
+  for(var i=0;i<TASKS.length;i++){ if(game[TASKS[i].id] >= 1) n++; }
+  return n;
+}
+function checkWin(){
+  if(allDone() && !game.won){
+    game.won = true;
+    game.wonAt = now;
+    game.winAck = false;
+    sfxWin();
+    burst(cat.x, cat.y-90, 'star', 40);
+    burst(cat.x, cat.y-130, 'heart', 18);
+    say('Fertig! Die Katze ist wunderschön und rundum gepflegt! 🐱✨', 4);
+  }
+}
+
+/* Streicheln: gibt der Katze Herzen (Bonus, kein Pflichtschritt) */
+function petCat(){
+  game.petCount++;
+  game.hearts = Math.min(999, game.hearts + 1);
+  burst(cat.x, cat.y-120, 'heart', 4);
+  sfxPop();
+  var fluff = ['Schnurr... 🐾','Miau! 💕','Schnurrr...','Die Katze genießt das.'];
+  say(fluff[game.petCount % fluff.length], 1.6);
+  if(game.petCount === 10) say('10 Streicheleinheiten! Die Katze liebt dich. 💖', 2.6);
+}
+
+function applyTool(kind){
+  /* Das Kissen ist die einzige Aktion, die NUR bei schlafender Katze wirkt */
+  if(sleeping && kind !== 'pillow'){
+    say('Die Katze schläft... wecke sie zuerst.',2.2); return;
+  }
+
+  if(kind === 'soap'){
+    if(game.wash >= 1){ say('Die Katze ist schon blitzsauber! ✨',2.2); return; }
+    if(!cat.inTub){ say('Setze die Katze zuerst in die Badewanne! 🛁',2.8); sfxPop(); return; }
+    game.wash = Math.min(1, game.wash + 0.34);
+    burst(cat.x, cat.y-60, 'bubble', 20);
+    sfxClean();
+    if(game.wash >= 1){ complete('Schrubb schrubb – die Katze ist blitzsauber! ✨'); }
+    else { say('Schrubb schrubb... noch ein bisschen! 🫧',2.0); }
+    checkWin();
+  }
+  else if(kind === 'comb'){
+    if(game.brush >= 1){ say('Das Fell ist schon ganz weich und ordentlich! ✨',2.2); return; }
+    game.brush = Math.min(1, game.brush + 0.34);
+    burst(cat.x, cat.y-100, 'spark', 12);
+    sfxClean();
+    if(game.brush >= 1){ complete('Das Fell ist weich und glänzt! ✨'); }
+    else { say('Bürste, bürste... nicht mehr zappeln!',2.0); }
+    checkWin();
+  }
+  else if(kind === 'food'){
+    if(game.feed >= 1){ say('Die Katze ist satt und zufrieden. 😋',2.2); return; }
+    game.feed = Math.min(1, game.feed + 0.34);
+    burst(cat.x+30, cat.y-20, 'crumb', 14);
+    sfxPop();
+    if(game.feed >= 1){
+      game.fed = true;
+      complete('Mjam mjam! Die Katze ist satt und schnurrt! 😋');
+      tone(240,0.5,'sine',0.05,180);
+    } else { say('Mjam mjam mjam! 🍗',2.0); }
+    checkWin();
+  }
+  else if(kind === 'scissor'){
+    if(game.claw >= 1){ say('Die Krallen sind schon kurz und sauber! ✨',2.2); return; }
+    game.claw = Math.min(1, game.claw + 0.34);
+    burst(cat.x-40, cat.y-10, 'spark', 12);
+    tone(1500,0.06,'square',0.03,900);
+    if(game.claw >= 1){ complete('Schnipp schnapp – die Krallen sind kurz! ✨'); }
+    else { say('Schnipp... die Katze zieht die Pfote weg. 🙃',2.0); }
+    checkWin();
+  }
+  else if(kind === 'brush2'){
+    if(game.teeth >= 1){ say('Die Zähne blitzen schon! 🦷✨',2.2); return; }
+    game.teeth = Math.min(1, game.teeth + 0.34);
+    burst(cat.x+50, cat.y-115, 'bubble', 16);
+    tone(900,0.07,'triangle',0.035,1300);
+    if(game.teeth >= 1){ complete('Blitzblanke Zähne! Kein Katzen-Mundgeruch mehr. 🪥'); }
+    else { say('Schrubbel schrubbel... Maul auf! 🦷',2.0); }
+    checkWin();
+  }
+  else if(kind === 'ball'){
+    if(game.play >= 1){ say('Die Katze ist schon müde vom Spielen. 😺',2.2); return; }
+    game.play = Math.min(1, game.play + 0.34);
+    burst(cat.x+70, cat.y-70, 'star', 14);
+    tone(700,0.09,'square',0.04,1100);
+    if(game.play >= 1){ complete('Miau! Die Katze hat getollt und ist glücklich! 🧶'); }
+    else { say('Die Katze jagt dem Ball nach! 🧶',2.0); }
+    checkWin();
+  }
+  else if(kind === 'pillow'){
+    if(game.nap >= 1){ say('Die Katze ist ausgeschlafen und munter! 😸',2.2); return; }
+    if(!sleeping){
+      say('Lege die Katze zuerst ins Bett – dann deck sie zu. 💤',2.8);
+      sfxPop(); return;
+    }    game.nap = Math.min(1, game.nap + 0.34);
+    burst(cat.x, cat.y-70, 'heart', 8);
+    tone(420,0.22,'sine',0.04,300);
+    if(game.nap >= 1){ complete('Gut zugedeckt – die Katze hat herrlich geschlafen! 💤'); }
+    else { say('Deck die Katze schön zu... 💤',2.0); }
+    checkWin();
+  }
+}
+
+/* ---------------- Partikel ---------------- */
+function burst(x,y,type,n){
+  for(var i=0;i<n;i++){
+    var a = Math.random()*TAU, sp = 40 + Math.random()*130;
+    game.particles.push({
+      x:x, y:y,
+      vx:Math.cos(a)*sp, vy:Math.sin(a)*sp - 40,
+      life:0, max:0.7 + Math.random()*0.8,
+      type:type, size:4 + Math.random()*7,
+      rot:Math.random()*TAU, vr:(Math.random()-0.5)*4
+    });
+  }
+}
+function updateParticles(dt){
+  for(var i=game.particles.length-1;i>=0;i--){
+    var p = game.particles[i];
+    p.life += dt;
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    p.vy += (p.type==='bubble' ? -70 : 210)*dt;
+    p.vx *= 0.99;
+    p.rot += p.vr*dt;
+    if(p.life >= p.max) game.particles.splice(i,1);
+  }
+}
+
+/* ---------------- Katzen-Farben ---------------- */
+function catPalette(){
+  var clean = game.wash;                 // 0 = dreckig, 1 = sauber
+  var base = mixArr([118,122,130],[242,182,104], clean);
+  var dark = [base[0]*0.80, base[1]*0.78, base[2]*0.80];
+  var light= [Math.min(255,base[0]*1.12+34), Math.min(255,base[1]*1.10+32), Math.min(255,base[2]*1.06+26)];
+  return { base:rgb(base), dark:rgb(dark), light:rgb(light), raw:base };
+}
+
+/* ---------------- Katze zeichnen ---------------- */
+function catHit(p){
+  if(sleeping){ return Math.abs(p.x-cat.x)<115 && p.y>cat.y-105 && p.y<cat.y+45; }
+  var s = cat.scale;
+  return p.x>cat.x-100*s && p.x<cat.x+130*s && p.y>cat.y-180*s && p.y<cat.y+22*s;
+}
+
+function drawCat(t){
+  if(sleeping){ drawCatSleeping(t); return; }
+  var pal = catPalette();
+  var dirty = 1-game.wash;
+  var messy = 1-game.brush;
+  var claw  = 1-game.claw;
+  var mood  = game.fed ? (allDone()? 'happy' : 'content') : 'hungry';
+  if(mood === 'hungry' && game.feed>0) mood = 'content';
+  if(game.play >= 1) mood = 'happy';          /* nach dem Spielen ist sie besonders fröhlich */
+  if(allDone()) mood = 'happy';
+  if(cat.grabbed) mood = 'shock';
+
+  ctx.save();
+  ctx.translate(cat.x, cat.y);
+  shadow(0, 4, 66*cat.scale, 0.20);
+  ctx.scale(cat.scale, cat.scale);
+
+  /* Schwanz */
+  var tw = Math.sin(cat.tail)*0.7 + (cat.grabbed?0.5:0);
+  ctx.strokeStyle = pal.dark; ctx.lineWidth = 15; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(52,-70);
+  ctx.bezierCurveTo(104,-72, 112+tw*14,-120, 88+tw*20,-152);
+  ctx.stroke();
+  ctx.strokeStyle = pal.light; ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(96+tw*16,-146);
+  ctx.lineTo(88+tw*20,-152);
+  ctx.stroke();
+
+  /* Hinterbeine */
+  ctx.fillStyle = pal.dark;
+  rr(18,-36,19,36,9); ctx.fill();
+  rr(50,-36,19,36,9); ctx.fill();
+  ctx.fillStyle = pal.light;
+  ell(27.5,-4,13,8); ctx.fill();
+  ell(59.5,-4,13,8); ctx.fill();
+
+  /* Körper */
+  ctx.fillStyle = pal.base;
+  ell(0,-62,72,46); ctx.fill();
+  /* Rücken-Abdunklung */
+  ctx.fillStyle = 'rgba(0,0,0,0.07)';
+  ell(6,-50,66,34); ctx.fill();
+
+  /* Streifen */
+  ctx.strokeStyle = pal.dark; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  for(var i=0;i<4;i++){
+    var sx = -46 + i*30;
+    ctx.beginPath();
+    ctx.moveTo(sx, -96 + Math.abs(i-1.5)*3);
+    ctx.quadraticCurveTo(sx+6, -78, sx+2, -62);
+    ctx.stroke();
+  }
+
+  /* Vorderbeine */
+  ctx.fillStyle = pal.base;
+  rr(-54,-38,19,38,9); ctx.fill();
+  rr(-26,-38,19,38,9); ctx.fill();
+  ctx.strokeStyle = pal.dark; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-44,-30); ctx.lineTo(-44,-8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-16,-30); ctx.lineTo(-16,-8); ctx.stroke();
+  ctx.fillStyle = pal.light;
+  ell(-44.5,-4,13,8); ctx.fill();
+  ell(-16.5,-4,13,8); ctx.fill();
+
+  /* Bauch */
+  ctx.fillStyle = pal.light;
+  ell(-16,-40,34,24); ctx.fill();
+
+  /* Kopf */
+  var hx = 74, hy = -110, hr = 37;
+  /* Ohren */
+  ctx.fillStyle = pal.base;
+  ctx.beginPath(); ctx.moveTo(hx-26,hy-24); ctx.lineTo(hx-14,hy-58); ctx.lineTo(hx+4,hy-30); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(hx+10,hy-30); ctx.lineTo(hx+28,hy-56); ctx.lineTo(hx+34,hy-22); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(240,150,170,0.85)';
+  ctx.beginPath(); ctx.moveTo(hx-19,hy-27); ctx.lineTo(hx-14,hy-48); ctx.lineTo(hx-3,hy-30); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(hx+16,hy-29); ctx.lineTo(hx+26,hy-47); ctx.lineTo(hx+29,hy-25); ctx.closePath(); ctx.fill();
+
+  /* Kopfkugel */
+  ctx.fillStyle = pal.base;
+  circ(hx,hy,hr); ctx.fill();
+  ctx.fillStyle = pal.light;
+  ell(hx-8,hy+14,24,17); ctx.fill();
+
+  /* Kopfstreifen */
+  ctx.strokeStyle = pal.dark; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(hx-6,hy-34); ctx.lineTo(hx-4,hy-22); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(hx+2,hy-36); ctx.lineTo(hx+4,hy-22); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(hx+10,hy-33); ctx.lineTo(hx+14,hy-21); ctx.stroke();
+
+  /* Barthaare */
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 2;
+  var wz = [[-1,-6],[0,0],[-1,6]];
+  for(var w=0; w<3; w++){
+    ctx.beginPath();
+    ctx.moveTo(hx-20, hy+6+wz[w][1]);
+    ctx.lineTo(hx-56, hy+2+wz[w][0]*6+wz[w][1]*1.4);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(hx+18, hy+6+wz[w][1]);
+    ctx.lineTo(hx+54, hy+2+wz[w][0]*6+wz[w][1]*1.4);
+    ctx.stroke();
+  }
+
+  /* Augen */
+  var blinkNow = cat.blink > 0.5;
+  function eye(ex,ey){
+    if(blinkNow || mood==='happy'){
+      ctx.strokeStyle = '#3a2b25'; ctx.lineWidth = 3.5; ctx.lineCap='round';
+      ctx.beginPath(); ctx.arc(ex, ey+3, 8, Math.PI*1.15, Math.PI*1.85); ctx.stroke();
+      return;
+    }
+    if(mood==='hungry'){
+      ctx.fillStyle = '#fff';
+      ell(ex,ey,9,6.5); ctx.fill();
+      ctx.fillStyle = '#5a3f2f';
+      circ(ex, ey+0.5, 4.2); ctx.fill();
+      ctx.strokeStyle = '#5a3f2f'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(ex-9,ey-9); ctx.lineTo(ex-2,ey-6); ctx.stroke();
+      return;
+    }
+    ctx.fillStyle = '#fff';
+    circ(ex,ey,10); ctx.fill();
+    ctx.fillStyle = '#5a3f2f';
+    circ(ex+ (mood==='shock'?0:0), ey, mood==='shock'?8.5:6.5); ctx.fill();
+    ctx.fillStyle = '#1d1410';
+    circ(ex, ey, 3.0); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    circ(ex-3, ey-3.5, 2.6); ctx.fill();
+  }
+  eye(hx-14, hy-6);
+  eye(hx+14, hy-6);
+
+  /* Näschen + Mund */
+  ctx.fillStyle = '#f28aa0';
+  ctx.beginPath();
+  ctx.moveTo(hx-5, hy+10); ctx.lineTo(hx+5, hy+10); ctx.lineTo(hx, hy+16);
+  ctx.closePath(); ctx.fill();
+
+  ctx.strokeStyle = '#4a342c'; ctx.lineWidth = 2.6; ctx.lineCap='round';
+  if(mood==='happy'){
+    ctx.beginPath(); ctx.arc(hx-6, hy+18, 7, 0, Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.arc(hx+6, hy+18, 7, 0, Math.PI); ctx.stroke();
+  } else if(mood==='hungry'){
+    ctx.fillStyle = '#8a4a4a';
+    ell(hx, hy+23, 8, 10); ctx.fill();
+    ctx.fillStyle = '#f28aa0';
+    ell(hx, hy+29, 5, 4); ctx.fill();
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(hx, hy+16);
+    ctx.lineTo(hx, hy+20);
+    ctx.moveTo(hx, hy+20);
+    ctx.quadraticCurveTo(hx-6, hy+26, hx-10, hy+19);
+    ctx.moveTo(hx, hy+20);
+    ctx.quadraticCurveTo(hx+6, hy+26, hx+10, hy+19);
+    ctx.stroke();
+  }
+
+  /* blitzblanke Zähne + Glitzer nach dem Zähneputzen (über dem Mund) */
+  if(game.teeth >= 1){
+    ctx.fillStyle = '#ffffff';
+    rr(hx-6, hy+18, 12, 5, 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(200,225,245,0.95)'; ctx.lineWidth=1; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    starPath(hx+20, hy-2, 7, 2.8, 4); ctx.fill();
+    starPath(hx+27, hy+7, 4.5, 1.8, 4); ctx.fill();
+    starPath(hx+13, hy-13, 4, 1.6, 4); ctx.fill();
+  }
+
+  /* Krallen */
+  if(claw > 0.2){
+    ctx.fillStyle = '#fdf6e3';
+    var clawLen = 9*claw;
+    [[-44.5,-10],[-16.5,-10],[27.5,-10],[59.5,-10]].forEach(function(p){
+      for(var c=-1;c<=1;c++){
+        ctx.beginPath();
+        ctx.moveTo(p[0]+c*7, p[1]);
+        ctx.lineTo(p[0]+c*7+2.5, p[1]-clawLen);
+        ctx.lineTo(p[0]+c*7+5, p[1]);
+        ctx.closePath(); ctx.fill();
+      }
+    });
+  }
+
+  /* Schmutz-Flecken */
+  if(dirty > 0.03){
+    ctx.fillStyle = 'rgba(78,66,52,'+(0.5*dirty)+')';
+    [[-42,-72,25],[-8,-42,30],[30,-74,23],[-62,-40,19],[22,-28,17],
+     [hx-6,hy-4,18],[hx+22,hy+6,15],[52,-48,20],[-18,-96,20],[8,-64,14]].forEach(function(d){
+      ell(d[0],d[1],d[2],d[2]*0.72, 0.3); ctx.fill();
+    });
+    /* Dreck-Fusseln */
+    ctx.strokeStyle = 'rgba(70,58,44,'+(0.45*dirty)+')'; ctx.lineWidth = 3;
+    for(var q=0;q<6;q++){
+      var ang = q*1.05;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(ang)*40, -62+Math.sin(ang)*22);
+      ctx.lineTo(Math.cos(ang)*52, -62+Math.sin(ang)*30);
+      ctx.stroke();
+    }
+  }
+
+  /* verwuscheltes Fell */
+  if(messy > 0.15){
+    ctx.fillStyle = pal.base;
+    var n = Math.round(messy*12);
+    for(var f=0; f<n; f++){
+      var a2 = Math.PI*1.05 + (f/(n-1||1))*Math.PI*0.9;
+      var bx = Math.cos(a2)*68, by = -62 + Math.sin(a2)*42;
+      ctx.beginPath();
+      ctx.moveTo(bx-7, by+6);
+      ctx.lineTo(bx+Math.cos(a2)*14*(0.6+messy*0.6), by+Math.sin(a2)*14);
+      ctx.lineTo(bx+7, by+8);
+      ctx.closePath(); ctx.fill();
+    }
+    /* Kopfhaar */
+    for(var f2=0; f2<4; f2++){
+      var ax = hx-18+f2*12;
+      ctx.beginPath();
+      ctx.moveTo(ax, hy-30);
+      ctx.lineTo(ax+4, hy-30-12*messy-6);
+      ctx.lineTo(ax+10, hy-27);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  ctx.restore();
+
+  /* Zzz beim Schlafen nicht hier */
+  if(sleeping) return;
+}
+
+function drawCatSleeping(t){
+  var pal = catPalette();
+  var dirty = 1-game.wash;
+  ctx.save();
+  ctx.translate(cat.x, cat.y);
+  shadow(0, 6, 78*cat.scale, 0.22);
+  ctx.scale(cat.scale, cat.scale);
+
+  /* eingerollter Schwanz */
+  ctx.strokeStyle = pal.dark; ctx.lineWidth = 16; ctx.lineCap='round';
+  ctx.beginPath();
+  ctx.moveTo(48,-42);
+  ctx.bezierCurveTo(86,-30, 60,6, 6,4);
+  ctx.stroke();
+
+  /* Körper (Laib) */
+  ctx.fillStyle = pal.base;
+  ell(-4,-46,86,48); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.07)';
+  ell(0,-34,76,34); ctx.fill();
+  ctx.fillStyle = pal.light;
+  ell(-30,-30,40,24); ctx.fill();
+
+  /* Kuscheldecke – wächst mit dem Zudecken-Fortschritt.
+     Wird vor dem Kopf gezeichnet, damit dieser frei bleibt. */
+  var cover = game.nap;
+  if(cover > 0 || sleeping){
+    var cov = Math.max(0.55, cover);
+    var topY = -6 - cov*54;          /* Oberkante wandert je Fortschritt nach oben */
+    ctx.save();
+    ell(-4,-46,84,46); ctx.clip();   /* nur der Rumpf */
+    var cg = ctx.createLinearGradient(0, topY, 0, 2);
+    cg.addColorStop(0,'#aed4f7'); cg.addColorStop(1,'#6f9fd8');
+    ctx.fillStyle = cg;
+    ctx.fillRect(-92, topY, 184, 120);
+    /* Stoff-Falten */
+    ctx.strokeStyle = 'rgba(255,255,255,0.32)'; ctx.lineWidth = 3;
+    for(var fq=0; fq<3; fq++){
+      ctx.beginPath();
+      ctx.moveTo(-30+fq*30, topY+4);
+      ctx.quadraticCurveTo(-18+fq*30, topY+22, -30+fq*30, 4);
+      ctx.stroke();
+    }
+    /* Borte am oberen Rand */
+    ctx.strokeStyle = '#e3eefb'; ctx.lineWidth = 9;
+    ctx.beginPath(); ctx.moveTo(-92, topY+3); ctx.lineTo(92, topY+3); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(-92, topY+1); ctx.lineTo(92, topY+1); ctx.stroke();
+    ctx.restore();
+  }
+
+  /* Kopf abgelegt */
+  var hx = -70, hy = -66;
+  ctx.fillStyle = pal.base;
+  ctx.beginPath(); ctx.moveTo(hx-22,hy-20); ctx.lineTo(hx-14,hy-50); ctx.lineTo(hx+2,hy-26); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(hx+12,hy-26); ctx.lineTo(hx+26,hy-46); ctx.lineTo(hx+30,hy-20); ctx.closePath(); ctx.fill();
+  circ(hx,hy,32); ctx.fill();
+  ctx.fillStyle = pal.light;
+  ell(hx-6,hy+12,20,14); ctx.fill();
+
+  /* geschlossene Augen */
+  ctx.strokeStyle = '#3a2b25'; ctx.lineWidth = 3.4; ctx.lineCap='round';
+  ctx.beginPath(); ctx.arc(hx-11, hy+1, 7, Math.PI*1.1, Math.PI*1.9); ctx.stroke();
+  ctx.beginPath(); ctx.arc(hx+13, hy+1, 7, Math.PI*1.1, Math.PI*1.9); ctx.stroke();
+  /* Näschen */
+  ctx.fillStyle = '#f28aa0';
+  ctx.beginPath(); ctx.moveTo(hx-5,hy+12); ctx.lineTo(hx+5,hy+12); ctx.lineTo(hx,hy+17); ctx.closePath(); ctx.fill();
+
+  if(dirty > 0.05){
+    ctx.fillStyle = 'rgba(78,66,52,'+(0.45*dirty)+')';
+    ell(20,-58,24,17,0.2); ctx.fill();
+    ell(-30,-56,20,14,-0.2); ctx.fill();
+    ell(60,-36,16,12); ctx.fill();
+  }
+  ctx.restore();
+
+  /* Zzz */
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  for(var i=0;i<3;i++){
+    var zt = (t*0.6 + i*0.33) % 1;
+    var zx = cat.x + 46 + i*16 - zt*10;
+    var zy = cat.y - 96 - i*24 - zt*26;
+    ctx.globalAlpha = 1-zt;
+    txt('z', zx, zy, 16+i*6, '#ffffff', 'center', true);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ---------------- Gegenstände zeichnen ---------------- */
+function drawSoap(){
+  ctx.save(); ctx.rotate(-0.07);
+  rr(-25,-30,50,56,10); ctx.fillStyle='#ff8fc0'; ctx.fill();
+  ctx.strokeStyle='#e0679b'; ctx.lineWidth=3; ctx.stroke();
+  rr(-17,-12,34,26,6); ctx.fillStyle='#fff7fb'; ctx.fill();
+  circ(0,1,7); ctx.fillStyle='#8fe0ff'; ctx.fill();
+  circ(-2,-1,2.4); ctx.fillStyle='#fff'; ctx.fill();
+  rr(-9,-42,18,14,4); ctx.fillStyle='#7d4bd8'; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-17,-22); ctx.lineTo(-17,16);
+  ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=4; ctx.stroke();
+  ctx.restore();
+}
+function drawComb(){
+  ctx.save(); ctx.rotate(0.12);
+  rr(-34,-10,68,17,8); ctx.fillStyle='#4fb3d9'; ctx.fill();
+  ctx.strokeStyle='#2d7fa3'; ctx.lineWidth=3; ctx.stroke();
+  ctx.strokeStyle='#9adcf3'; ctx.lineWidth=5; ctx.lineCap='round';
+  for(var i=0;i<9;i++){ var x=-27+i*6.8; ctx.beginPath(); ctx.moveTo(x,6); ctx.lineTo(x,26); ctx.stroke(); }
+  ctx.restore();
+}
+function drawScissor(){
+  ctx.save(); ctx.rotate(-0.45);
+  ctx.fillStyle='#dbe3ec';
+  ctx.beginPath(); ctx.moveTo(-5,-4); ctx.lineTo(36,-27); ctx.lineTo(38,-16); ctx.lineTo(-2,3); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-5,4); ctx.lineTo(36,27); ctx.lineTo(38,16); ctx.lineTo(-2,-3); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='#9aa8b8'; ctx.lineWidth=2; ctx.stroke();
+  circ(0,0,5.5); ctx.fillStyle='#6b7280'; ctx.fill();
+  ctx.strokeStyle='#f97316'; ctx.lineWidth=5.5;
+  circ(-20,-11,10); ctx.stroke();
+  circ(-20,11,10); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-8,-6); ctx.lineTo(-13,-10); ctx.moveTo(-8,6); ctx.lineTo(-13,10); ctx.stroke();
+  ctx.restore();
+}
+function drawFood(){
+  ell(0,4,40,16); ctx.fillStyle='#7ec8e3'; ctx.fill();
+  ctx.strokeStyle='#4a90a4'; ctx.lineWidth=3; ctx.stroke();
+  ell(0,-2,32,13); ctx.fillStyle='#5aa9c4'; ctx.fill();
+  for(var i=0;i<10;i++){
+    var a=i*0.72, kx=Math.cos(a)*18*(0.35+((i%3)*0.3)), ky=-2+Math.sin(a)*7;
+    circ(kx,ky,5); ctx.fillStyle = i%3 ? '#b07a3f' : '#8a5a2b'; ctx.fill();
+    circ(kx-1.5,ky-1.5,1.6); ctx.fillStyle='rgba(255,255,255,0.35)'; ctx.fill();
+  }
+  ctx.fillStyle='#e8f6fb';
+  ell(-14,-1,7,4,-0.6); ctx.fill();
+}
+function drawToothbrush(){
+  ctx.save(); ctx.rotate(-0.35);
+  rr(-8,-40,16,64,7); ctx.fillStyle='#7ec8e3'; ctx.fill();
+  ctx.strokeStyle='#4a90a4'; ctx.lineWidth=2.5; ctx.stroke();
+  ctx.fillStyle='#ffffff'; ctx.fillRect(-5,-30,10,14);
+  rr(-8,18,16,34,7); ctx.fillStyle='#a8d8ea'; ctx.fill();
+  ctx.strokeStyle='#7ab8d0'; ctx.lineWidth=2.5; ctx.stroke();
+  /* Borsten */
+  ctx.fillStyle='#f4f8ff';
+  for(var b=0;b<3;b++){
+    for(var c=0;c<3;c++){
+      circ(-5+c*5, -34-b*7, 2.6); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+function drawBall(){
+  ctx.save();
+  circ(0,0,26); ctx.fillStyle='#f2c14e'; ctx.fill();
+  ctx.strokeStyle='#d19c2a'; ctx.lineWidth=2.5; ctx.stroke();
+  ctx.strokeStyle='#e0a800'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.arc(-9,0,24,-1.1,1.1); ctx.stroke();
+  ctx.beginPath(); ctx.arc(9,0,24,Math.PI-1.1,Math.PI+1.1); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0,-9,24,0.55,Math.PI-0.55); ctx.stroke();
+  /* Wollfaden */
+  ctx.strokeStyle='#e0679b'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(20,16);
+  ctx.quadraticCurveTo(40,26, 52,14); ctx.stroke();
+  ctx.restore();
+}
+function drawPillow(){
+  ctx.save(); ctx.rotate(0.08);
+  rr(-38,-24,76,48,16); ctx.fillStyle='#fdf1f6'; ctx.fill();
+  ctx.strokeStyle='#e8cfdd'; ctx.lineWidth=3; ctx.stroke();
+  rr(-30,-16,60,32,12); ctx.fillStyle='#f8e3ef'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(-22,-8); ctx.lineTo(22,-8); ctx.stroke();
+  /* kleine Mondsichel */
+  circ(0,0,10); ctx.fillStyle='#c9a8e0'; ctx.fill();
+  circ(4,-2,9); ctx.fillStyle='#f8e3ef'; ctx.fill();
+  ctx.restore();
+}
+function drawItemAt(kind,x,y,t,big){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.translate(0, Math.sin(t*3 + x*0.04)*2);
+  var s = big?1.25:1;
+  ctx.scale(s,s);
+  shadow(0, 22, 30, 0.16);
+  if(kind==='soap') drawSoap();
+  else if(kind==='comb') drawComb();
+  else if(kind==='scissor') drawScissor();
+  else if(kind==='food') drawFood();
+  else if(kind==='brush2') drawToothbrush();
+  else if(kind==='ball') drawBall();
+  else if(kind==='pillow') drawPillow();
+  ctx.restore();
+}
+function labelPill(text,x,y){
+  ctx.font = 'bold 14px "Trebuchet MS",Verdana,sans-serif';
+  var w = ctx.measureText(text).width + 22;
+  rr(x-w/2, y-13, w, 26, 13);
+  ctx.fillStyle = 'rgba(30,20,40,0.72)'; ctx.fill();
+  txt(text, x, y+1, 14, '#fff', 'center', true);
+}
+
+/* ---------------- Räume ---------------- */
+function drawBathroom(t){
+  /* Wand */
+  ctx.fillStyle = '#dcefF2'; ctx.fillRect(0,0,W,430);
+  ctx.strokeStyle = 'rgba(150,200,210,0.55)'; ctx.lineWidth = 2;
+  for(var x=0;x<=W;x+=64){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,430); ctx.stroke(); }
+  for(var y=0;y<=430;y+=64){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  /* Boden */
+  var g = ctx.createLinearGradient(0,430,0,H);
+  g.addColorStop(0,'#c6cfd6'); g.addColorStop(1,'#aab5bf');
+  ctx.fillStyle = g; ctx.fillRect(0,430,W,H-430);
+  ctx.strokeStyle = 'rgba(120,135,150,0.45)'; ctx.lineWidth = 2;
+  for(var i=0;i<9;i++){ ctx.beginPath(); ctx.moveTo(i*120,430); ctx.lineTo(i*70-60,H); ctx.stroke(); }
+  for(var j=460;j<H;j+=46){ ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(W,j); ctx.stroke(); }
+  /* Sockelleiste */
+  ctx.fillStyle = '#f4f8fa'; ctx.fillRect(0,414,W,18);
+
+  /* Spiegel */
+  rr(60,96,210,158,16); ctx.fillStyle='#eaf6ff'; ctx.fill();
+  ctx.strokeStyle='#a9c3cf'; ctx.lineWidth=6; ctx.stroke();
+  ctx.save(); rr(72,108,186,134,10); ctx.clip();
+  ctx.fillStyle='#cfeaf6'; ctx.fillRect(72,108,186,134);
+  ctx.strokeStyle='rgba(255,255,255,0.85)'; ctx.lineWidth=14;
+  ctx.beginPath(); ctx.moveTo(70,240); ctx.lineTo(180,104); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(140,250); ctx.lineTo(250,130); ctx.stroke();
+  ctx.restore();
+
+  /* Waschbecken */
+  rr(46,296,262,28,8); ctx.fillStyle='#ece3d8'; ctx.fill();
+  ctx.strokeStyle='#cfc0b0'; ctx.lineWidth=3; ctx.stroke();
+  rr(58,324,238,94,10); ctx.fillStyle='#ded2c3'; ctx.fill();
+  ctx.strokeStyle='#c3b3a0'; ctx.lineWidth=3; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(177,324); ctx.lineTo(177,418); ctx.stroke();
+  circ(166,368,4); ctx.fillStyle='#b0a08d'; ctx.fill();
+  circ(188,368,4); ctx.fill();
+  ell(177,296,74,22); ctx.fillStyle='#f8fcfd'; ctx.fill();
+  ctx.strokeStyle='#c8d6de'; ctx.lineWidth=3; ctx.stroke();
+  /* Hahn */
+  ctx.fillStyle='#b9c6cf'; rr(160,258,26,42,8); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(173,258); ctx.lineTo(173,236); ctx.lineTo(200,236); ctx.lineTo(200,248);
+  ctx.lineWidth=10; ctx.strokeStyle='#b9c6cf'; ctx.lineCap='round'; ctx.stroke();
+
+  /* Fenster */
+  rr(360,110,150,160,12); ctx.fillStyle='#bfe6f7'; ctx.fill();
+  ctx.strokeStyle='#f7fbfd'; ctx.lineWidth=10; ctx.stroke();
+  ctx.save(); rr(366,116,138,148,8); ctx.clip();
+  var wg = ctx.createLinearGradient(0,116,0,264);
+  wg.addColorStop(0,'#bfe9ff'); wg.addColorStop(1,'#e9f8ff');
+  ctx.fillStyle=wg; ctx.fillRect(366,116,138,148);
+  circ(460,160,22); ctx.fillStyle='#ffe27a'; ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,0.85)';
+  ell(410,190,26,14); ctx.fill(); ell(432,186,20,12); ctx.fill();
+  ell(400,225,30,14); ctx.fill(); ell(425,222,22,12); ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle='#f7fbfd'; ctx.lineWidth=8;
+  ctx.beginPath(); ctx.moveTo(435,120); ctx.lineTo(435,262); ctx.moveTo(370,190); ctx.lineTo(500,190); ctx.stroke();
+
+  /* Handtuch */
+  rr(560,150,74,150,10); ctx.fillStyle='#8fd0e8'; ctx.fill();
+  ctx.strokeStyle='#63aecb'; ctx.lineWidth=3; ctx.stroke();
+  ctx.fillStyle='#b6e4f4'; ctx.fillRect(566,214,62,26);
+
+  /* Badewanne */
+  var tubX=520, tubY=346, tubW=392, tubH=190;
+  rr(tubX,tubY,tubW,tubH,44); ctx.fillStyle='#fbfdff'; ctx.fill();
+  ctx.strokeStyle='#c8d6de'; ctx.lineWidth=5; ctx.stroke();
+  rr(tubX+22,tubY+26,tubW-44,tubH-50,34); ctx.fillStyle='#eaf6fa'; ctx.fill();
+  /* Wasser */
+  ctx.save();
+  rr(tubX+34,tubY+40,tubW-68,tubH-78,26); ctx.clip();
+  var wg2 = ctx.createLinearGradient(0,tubY+40,0,tubY+tubH-38);
+  wg2.addColorStop(0,'#9fe0f0'); wg2.addColorStop(1,'#5fb6d6');
+  ctx.fillStyle=wg2; ctx.fillRect(tubX+34,tubY+40,tubW-68,tubH-78);
+  for(var b=0;b<26;b++){
+    var bx = tubX+44 + ((b*97)%(tubW-90));
+    var by = tubY+52 + ((b*53)%(tubH-100));
+    circ(bx, by+Math.sin(t*1.6+b)*4, 4+(b%3)*3.2);
+    ctx.fillStyle='rgba(255,255,255,0.75)'; ctx.fill();
+  }
+  ctx.restore();
+  /* Wannenrand-Vorderkante (damit die Katze optisch IM Wasser sitzt) */
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(tubX+34, tubY+tubH-46, tubW-68, 46);
+  ctx.clip();
+  rr(tubX+22,tubY+26,tubW-44,tubH-50,34); ctx.lineWidth=26;
+  ctx.strokeStyle='rgba(251,253,255,0.96)'; ctx.stroke();
+  ctx.restore();
+  /* Wasserhahn */
+  ctx.strokeStyle='#b9c6cf'; ctx.lineWidth=12; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(tubX+30,tubY-6); ctx.lineTo(tubX+30,tubY-34); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(tubX+30,tubY-34); ctx.lineTo(tubX+70,tubY-34); ctx.stroke();
+  circ(tubX+30,tubY-40,8); ctx.fillStyle='#9fb0bb'; ctx.fill();
+  circ(tubX+72,tubY+16,10); ctx.fillStyle='#dbe6ec'; ctx.fill();
+  ctx.strokeStyle='#b9c6cf'; ctx.lineWidth=2; ctx.stroke();
+  /* Füße */
+  ctx.fillStyle='#c8d6de';
+  rr(tubX+40,tubY+tubH-6,34,16,6); ctx.fill();
+  rr(tubX+tubW-74,tubY+tubH-6,34,16,6); ctx.fill();
+
+  /* Badematte */
+  ell(300,522,96,26); ctx.fillStyle='#a8d8ea'; ctx.fill();
+  ctx.strokeStyle='#84bdd4'; ctx.lineWidth=3; ctx.stroke();
+}
+
+function drawBedroom(t){
+  ctx.fillStyle = '#f0e8fa'; ctx.fillRect(0,0,W,470);
+  ctx.fillStyle = 'rgba(214,196,240,0.5)';
+  for(var x=0;x<W;x+=64){ ctx.fillRect(x,0,32,470); }
+  /* Boden */
+  var g = ctx.createLinearGradient(0,470,0,H);
+  g.addColorStop(0,'#cd9463'); g.addColorStop(1,'#b07c4c');
+  ctx.fillStyle=g; ctx.fillRect(0,470,W,H-470);
+  ctx.strokeStyle='rgba(120,80,40,0.35)'; ctx.lineWidth=2;
+  for(var j=490;j<H;j+=34){ ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(W,j); ctx.stroke(); }
+  for(var i2=0;i2<W;i2+=140){ ctx.beginPath(); ctx.moveTo(i2,j-34); ctx.lineTo(i2,j); ctx.stroke(); }
+  ctx.fillStyle = '#e6d8f2'; ctx.fillRect(0,452,W,20);
+
+  /* Fenster mit Nachthimmel */
+  rr(592,116,178,168,12); ctx.fillStyle='#202a5c'; ctx.fill();
+  ctx.strokeStyle='#f7f2ff'; ctx.lineWidth=10; ctx.stroke();
+  ctx.save(); rr(598,122,166,156,8); ctx.clip();
+  var ng = ctx.createLinearGradient(0,122,0,278);
+  ng.addColorStop(0,'#141a3d'); ng.addColorStop(1,'#2c3a72');
+  ctx.fillStyle=ng; ctx.fillRect(598,122,166,156);
+  circ(700,168,26); ctx.fillStyle='#fdf3c0'; ctx.fill();
+  circ(690,160,22); ctx.fillStyle='#1c2450'; ctx.fill();
+  ctx.fillStyle='#fff';
+  for(var s2=0;s2<16;s2++){
+    var sx=610+((s2*53)%150), sy=130+((s2*71)%140);
+    circ(sx,sy, (s2%3===0)?2.2:1.3); ctx.fill();
+  }
+  ctx.restore();
+  ctx.strokeStyle='#f7f2ff'; ctx.lineWidth=7;
+  ctx.beginPath(); ctx.moveTo(681,122); ctx.lineTo(681,278); ctx.moveTo(598,200); ctx.lineTo(764,200); ctx.stroke();
+
+  /* Bild an der Wand */
+  rr(300,140,150,110,8); ctx.fillStyle='#d9c2a6'; ctx.fill();
+  ctx.strokeStyle='#a9866a'; ctx.lineWidth=6; ctx.stroke();
+  ctx.fillStyle='#bfe4f5'; ctx.fillRect(310,150,130,90);
+  circ(345,178,13); ctx.fillStyle='#ffe27a'; ctx.fill();
+  ctx.fillStyle='#8fbf6f';
+  ctx.beginPath(); ctx.moveTo(310,240); ctx.lineTo(370,190); ctx.lineTo(440,240); ctx.closePath(); ctx.fill();
+
+  /* Bett */
+  rr(76,296,118,196,18); ctx.fillStyle='#8b5a2b'; ctx.fill();
+  ctx.strokeStyle='#6d431e'; ctx.lineWidth=3; ctx.stroke();
+  rr(92,332,472,132,14); ctx.fillStyle='#a9744a'; ctx.fill();
+  rr(96,326,468,120,14); ctx.fillStyle='#fff6ea'; ctx.fill();
+  rr(96,380,468,84,14); ctx.fillStyle='#7aa7e8'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.55)'; ctx.lineWidth=4;
+  for(var b2=0;b2<5;b2++){ ctx.beginPath(); ctx.moveTo(120+b2*92,382); ctx.lineTo(120+b2*92,462); ctx.stroke(); }
+  rr(112,312,124,70,18); ctx.fillStyle='#fdf1f6'; ctx.fill();
+  ctx.strokeStyle='#eddcE6'; ctx.lineWidth=3; ctx.stroke();
+  ctx.fillStyle='#8b5a2b';
+  rr(96,462,18,42,5); ctx.fill();
+  rr(542,462,18,42,5); ctx.fill();
+
+  /* Nachttisch + Lampe */
+  rr(600,392,102,150,10); ctx.fillStyle='#a9744a'; ctx.fill();
+  ctx.strokeStyle='#845a35'; ctx.lineWidth=3; ctx.stroke();
+  ctx.fillStyle='#8b5a2b'; ctx.fillRect(610,430,82,36);
+  circ(651,448,5); ctx.fillStyle='#e8c97a'; ctx.fill();
+  ctx.fillStyle='#6d431e'; ctx.fillRect(612,486,78,4);
+  /* Lampe */
+  ctx.fillStyle='#7d6a8f'; ctx.fillRect(644,352,14,42);
+  ctx.beginPath(); ctx.moveTo(616,356); ctx.lineTo(686,356); ctx.lineTo(674,318); ctx.lineTo(628,318); ctx.closePath();
+  ctx.fillStyle='#ffd98a'; ctx.fill();
+  ctx.save(); ctx.globalAlpha=0.22; circ(651,368,72);
+  var lg=ctx.createRadialGradient(651,368,4,651,368,72);
+  lg.addColorStop(0,'rgba(255,225,150,0.9)'); lg.addColorStop(1,'rgba(255,225,150,0)');
+  ctx.fillStyle=lg; ctx.beginPath(); ctx.arc(651,368,72,0,TAU); ctx.fill(); ctx.restore();
+
+  /* Tür */
+  rr(828,250,112,292,10); ctx.fillStyle='#c9a27a'; ctx.fill();
+  ctx.strokeStyle='#a37e57'; ctx.lineWidth=4; ctx.stroke();
+  rr(842,266,84,180,8); ctx.fillStyle='#b98f66'; ctx.fill();
+  circ(900,400,7); ctx.fillStyle='#f0d08a'; ctx.fill();
+
+  /* Teppich */
+  ell(742,540,120,42); ctx.fillStyle='#b39ddb'; ctx.fill();
+  ctx.strokeStyle='#9379c4'; ctx.lineWidth=5; ctx.stroke();
+  ell(742,540,84,26); ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=3; ctx.stroke();
+}
+
+function drawLiving(t){
+  ctx.fillStyle = '#fdf2de'; ctx.fillRect(0,0,W,470);
+  ctx.fillStyle = 'rgba(246,226,196,0.85)';
+  for(var x=0;x<W;x+=72){ ctx.fillRect(x,0,36,470); }
+  /* Boden */
+  var g = ctx.createLinearGradient(0,470,0,H);
+  g.addColorStop(0,'#d6a86e'); g.addColorStop(1,'#b98b52');
+  ctx.fillStyle=g; ctx.fillRect(0,470,W,H-470);
+  ctx.strokeStyle='rgba(140,95,50,0.35)'; ctx.lineWidth=2;
+  for(var j=492;j<H;j+=32){ ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(W,j); ctx.stroke(); }
+  ctx.fillStyle='#f6e6c8'; ctx.fillRect(0,452,W,20);
+
+  /* Fenster (Tag) */
+  rr(624,116,180,168,12); ctx.fillStyle='#cdeafd'; ctx.fill();
+  ctx.strokeStyle='#fffaf0'; ctx.lineWidth=10; ctx.stroke();
+  ctx.save(); rr(630,122,168,156,8); ctx.clip();
+  var wg = ctx.createLinearGradient(0,122,0,278);
+  wg.addColorStop(0,'#bfe7ff'); wg.addColorStop(1,'#eefaff');
+  ctx.fillStyle=wg; ctx.fillRect(630,122,168,156);
+  circ(736,168,24); ctx.fillStyle='#ffe27a'; ctx.fill();
+  ctx.fillStyle='rgba(255,255,255,0.9)';
+  ell(686,206,30,15); ctx.fill(); ell(712,202,22,12); ctx.fill();
+  ell(672,242,32,14); ctx.fill(); ell(700,238,24,12); ctx.fill();
+  ctx.fillStyle='#a8d98a'; ctx.fillRect(630,258,168,20);
+  ctx.restore();
+  ctx.strokeStyle='#fffaf0'; ctx.lineWidth=7;
+  ctx.beginPath(); ctx.moveTo(714,122); ctx.lineTo(714,278); ctx.moveTo(630,200); ctx.lineTo(798,200); ctx.stroke();
+
+  /* Bild */
+  rr(300,150,140,100,8); ctx.fillStyle='#f3e0bd'; ctx.fill();
+  ctx.strokeStyle='#c9a86f'; ctx.lineWidth=6; ctx.stroke();
+  ctx.fillStyle='#ffd9e8'; ctx.fillRect(310,160,120,80);
+  circ(370,200,24); ctx.fillStyle='#ff9dbb'; ctx.fill();
+  circ(356,190,7); ctx.fillStyle='#fff'; ctx.fill();
+
+  /* Sofa */
+  rr(48,326,382,116,20); ctx.fillStyle='#d97b7b'; ctx.fill();
+  ctx.strokeStyle='#b95f5f'; ctx.lineWidth=3; ctx.stroke();
+  rr(38,418,402,112,20); ctx.fillStyle='#c96f6f'; ctx.fill();
+  ctx.strokeStyle='#b95f5f'; ctx.lineWidth=3; ctx.stroke();
+  rr(62,414,168,86,16); ctx.fillStyle='#e58f8f'; ctx.fill();
+  rr(242,414,168,86,16); ctx.fill();
+  ctx.strokeStyle='#c96f6f'; ctx.lineWidth=3; ctx.stroke();
+  rr(24,404,46,116,16); ctx.fillStyle='#e58f8f'; ctx.fill();
+  rr(408,404,46,116,16); ctx.fill();
+  ctx.fillStyle='#8b5a2b';
+  rr(56,528,18,22,4); ctx.fill();
+  rr(404,528,18,22,4); ctx.fill();
+  /* Kissen */
+  rr(84,360,74,62,14); ctx.fillStyle='#f6dfa8'; ctx.fill();
+  ctx.strokeStyle='#dcc084'; ctx.lineWidth=3; ctx.stroke();
+  rr(330,360,74,62,14); ctx.fillStyle='#a8d8ea'; ctx.fill();
+  ctx.strokeStyle='#82bcd4'; ctx.lineWidth=3; ctx.stroke();
+
+  /* Couchtisch */
+  rr(468,468,164,18,8); ctx.fillStyle='#a9744a'; ctx.fill();
+  ctx.strokeStyle='#845a35'; ctx.lineWidth=3; ctx.stroke();
+  ctx.fillStyle='#8b5a2b';
+  rr(480,486,14,58,5); ctx.fill();
+  rr(606,486,14,58,5); ctx.fill();
+  /* Pflanze */
+  ctx.fillStyle='#c97a4a';
+  ctx.beginPath(); ctx.moveTo(536,468); ctx.lineTo(572,468); ctx.lineTo(566,440); ctx.lineTo(542,440); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='#7fbf6a'; ctx.lineWidth=6; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(554,442); ctx.lineTo(554,414); ctx.stroke();
+  ctx.fillStyle='#8fcf7a';
+  ell(542,408,16,9,-0.5); ctx.fill();
+  ell(568,408,16,9,0.5); ctx.fill();
+  ell(554,398,13,10); ctx.fill();
+
+  /* Stehlampe */
+  ctx.fillStyle='#7d6a8f'; ctx.fillRect(898,300,12,240);
+  ell(904,542,32,10); ctx.fillStyle='#6b5b7d'; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(868,302); ctx.lineTo(940,302); ctx.lineTo(926,246); ctx.lineTo(882,246); ctx.closePath();
+  ctx.fillStyle='#ffe0a0'; ctx.fill();
+  ctx.save();
+  var lg=ctx.createRadialGradient(904,306,4,904,306,84);
+  lg.addColorStop(0,'rgba(255,228,160,0.45)'); lg.addColorStop(1,'rgba(255,228,160,0)');
+  ctx.fillStyle=lg; ctx.beginPath(); ctx.arc(904,306,84,0,TAU); ctx.fill(); ctx.restore();
+
+  /* Teppich */
+  ell(600,548,150,46); ctx.fillStyle='#e8b7b7'; ctx.fill();
+  ctx.strokeStyle='#cf9090'; ctx.lineWidth=5; ctx.stroke();
+  ell(600,548,110,30); ctx.strokeStyle='rgba(255,255,255,0.65)'; ctx.lineWidth=3; ctx.stroke();
+}
+
+function drawRoom(t){
+  if(roomId==='bathroom') drawBathroom(t);
+  else if(roomId==='bedroom') drawBedroom(t);
+  else drawLiving(t);
+}
+
+function drawTubWaterOverlay(){
+  if(roomId!=='bathroom' || !cat.inTub) return;
+  ctx.save();
+  rr(554,486,324,50,22); ctx.clip();
+  var wg = ctx.createLinearGradient(0,486,0,536);
+  wg.addColorStop(0,'rgba(150,225,242,0.92)'); wg.addColorStop(1,'rgba(90,185,215,0.92)');
+  ctx.fillStyle = wg; ctx.fillRect(554,486,324,50);
+  ctx.restore();
+  for(var b=0;b<8;b++){
+    var bx = 590 + ((b*97)%250);
+    ctx.save();
+    rr(554,486,324,50,22); ctx.clip();
+    circ(bx, 500+((b*31)%30)+Math.sin(now*1.7+b)*3, 4+(b%3)*2.6);
+    ctx.fillStyle='rgba(255,255,255,0.85)'; ctx.fill();
+    ctx.restore();
+  }
+}
+
+/* ---------------- Partikel zeichnen ---------------- */
+function drawParticles(){
+  for(var i=0;i<game.particles.length;i++){
+    var p = game.particles[i];
+    var k = 1 - p.life/p.max;
+    ctx.save();
+    ctx.globalAlpha = clamp(k,0,1);
+    ctx.translate(p.x,p.y);
+    if(p.type==='bubble'){
+      circ(0,0,p.size*0.8); ctx.strokeStyle='rgba(255,255,255,0.95)'; ctx.lineWidth=2.4; ctx.stroke();
+      circ(-p.size*0.25,-p.size*0.25,p.size*0.3); ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.fill();
+    } else if(p.type==='star'){
+      ctx.rotate(p.rot);
+      starPath(0,0,p.size,p.size*0.45,5);
+      ctx.fillStyle='#ffe066'; ctx.fill();
+      ctx.strokeStyle='rgba(255,180,0,0.8)'; ctx.lineWidth=1.5; ctx.stroke();
+    } else if(p.type==='heart'){
+      ctx.rotate(Math.sin(p.rot)*0.3);
+      heartPath(0,0,p.size);
+      ctx.fillStyle='#ff7fa8'; ctx.fill();
+    } else if(p.type==='crumb'){
+      circ(0,0,p.size*0.5); ctx.fillStyle='#a9744a'; ctx.fill();
+    } else {
+      starPath(0,0,p.size*0.7,p.size*0.28,4);
+      ctx.fillStyle='#ffffff'; ctx.fill();
+    }
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+function starPath(x,y,r1,r2,n){
+  ctx.beginPath();
+  for(var i=0;i<n*2;i++){
+    var a = -Math.PI/2 + i*Math.PI/n;
+    var rad = i%2? r2 : r1;
+    var px = x+Math.cos(a)*rad, py = y+Math.sin(a)*rad;
+    if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  }
+  ctx.closePath();
+}
+function heartPath(x,y,s){
+  ctx.beginPath();
+  ctx.moveTo(x, y+s*0.75);
+  ctx.bezierCurveTo(x-s*1.5, y-s*0.4, x-s*0.5, y-s*1.35, x, y-s*0.45);
+  ctx.bezierCurveTo(x+s*0.5, y-s*1.35, x+s*1.5, y-s*0.4, x, y+s*0.75);
+  ctx.closePath();
+}
+
+/* ---------------- HUD ---------------- */
+function button(id,x,y,w,h){ uiButtons.push({id:id,x:x,y:y,w:w,h:h}); }
+
+function drawHud(t){
+  /* Aufgaben oben: 7 kompakte Karten */
+  var n = TASKS.length;
+  var pad = 10, gap = 7;
+  var cw = Math.floor((W - pad*2 - gap*(n-1) - 62) / n);
+  for(var i=0;i<n;i++){
+    var tk = TASKS[i];
+    var v = prog(tk.id);
+    var x = pad + i*(cw+gap), y = 12, h = 54;
+    rr(x,y,cw,h,12);
+    ctx.fillStyle = v>=1 ? 'rgba(46,160,96,0.95)' : 'rgba(34,24,48,0.80)';
+    ctx.fill();
+    ctx.strokeStyle = v>=1 ? 'rgba(150,240,190,0.95)' : 'rgba(255,255,255,0.20)';
+    ctx.lineWidth = 2; ctx.stroke();
+
+    txt(tk.icon, x+cw/2, y+18, 19, '#fff', 'center');
+    var lblSize = 12;
+    ctx.font = 'bold '+lblSize+'px "Trebuchet MS",Verdana,sans-serif';
+    while(ctx.measureText(tk.label).width > cw-12 && lblSize > 9){
+      lblSize--; ctx.font='bold '+lblSize+'px "Trebuchet MS",Verdana,sans-serif';
+    }
+    txt(tk.label, x+cw/2, y+34, lblSize, '#fff', 'center', true);
+
+    rr(x+8, y+42, cw-16, 8, 4); ctx.fillStyle='rgba(0,0,0,0.38)'; ctx.fill();
+    rr(x+8, y+42, Math.max(4,(cw-16)*v), 8, 4);
+    ctx.fillStyle = v>=1 ? '#8ff0b6' : '#ffd166'; ctx.fill();
+    if(v>=1){ txt('✔', x+cw-11, y+16, 15, '#d6ffe6', 'center', true); }
+  }
+
+  /* Herz-Zähler */
+  var hx0 = W-58, hy0 = 12;
+  rr(hx0, hy0, 46, 30, 9); ctx.fillStyle='rgba(34,24,48,0.80)'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.20)'; ctx.lineWidth=2; ctx.stroke();
+  txt('💖', hx0+15, hy0+16, 15, '#fff', 'center');
+  txt(''+game.hearts, hx0+34, hy0+16, 13, '#ffc7dd', 'center', true);
+
+  /* Ton-Knopf */
+  button('mute', W-58, 48, 46, 34);
+  rr(W-58,48,46,34,10); ctx.fillStyle='rgba(34,24,48,0.80)'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.20)'; ctx.lineWidth=2; ctx.stroke();
+  txt(muted?'🔇':'🔊', W-35, 65, 17, '#fff', 'center');
+
+  /* Nachricht */
+  if(msgTimer > 0){
+    ctx.font = 'bold 18px "Trebuchet MS",Verdana,sans-serif';
+    var tw = ctx.measureText(msg).width;
+    var bw = Math.min(W-120, tw+56);
+    var bx = W/2 - bw/2, by = 84;
+    ctx.globalAlpha = clamp(msgTimer, 0, 1);
+    rr(bx,by,bw,44,16); ctx.fillStyle='rgba(28,18,40,0.88)'; ctx.fill();
+    ctx.strokeStyle='rgba(255,216,120,0.75)'; ctx.lineWidth=2; ctx.stroke();
+    txt(msg, W/2, by+23, 18, '#fff6d8', 'center', true);
+    ctx.globalAlpha = 1;
+  }
+
+  /* Untere Leiste */
+  ctx.fillStyle = 'rgba(22,15,32,0.86)';
+  ctx.fillRect(0, H-84, W, 84);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(0,H-84); ctx.lineTo(W,H-84); ctx.stroke();
+
+  var rooms = [
+    {id:'bathroom', label:'🛁 Bad',        w:150},
+    {id:'living',   label:'🛋️ Wohnzimmer', w:180},
+    {id:'bedroom',  label:'🛏️ Schlafzimmer', w:190}
+  ];
+  var bx2 = 18;
+  for(var r=0;r<rooms.length;r++){
+    var rm = rooms[r];
+    var active = roomId===rm.id;
+    button('room:'+rm.id, bx2, H-66, rm.w, 46);
+    rr(bx2, H-66, rm.w, 46, 12);
+    ctx.fillStyle = active ? 'rgba(255,209,102,0.95)' : 'rgba(255,255,255,0.12)';
+    ctx.fill();
+    ctx.strokeStyle = active ? '#fff0c0' : 'rgba(255,255,255,0.2)';
+    ctx.lineWidth=2; ctx.stroke();
+    txt(rm.label, bx2+rm.w/2, H-42, 16, active?'#3a2a12':'#f0e8ff', 'center', true);
+    bx2 += rm.w + 12;
+  }
+
+  /* Hinweis */
+  var hint = getHint();
+  if(hint){
+    var hx = bx2 + 16, hw = W - hx - 24;
+    rr(hx, H-66, hw, 46, 12); ctx.fillStyle='rgba(255,255,255,0.08)'; ctx.fill();
+    ctx.strokeStyle='rgba(255,255,255,0.14)'; ctx.lineWidth=2; ctx.stroke();
+    var size = 15;
+    ctx.font = 'bold '+size+'px "Trebuchet MS",Verdana,sans-serif';
+    while(ctx.measureText(hint).width > hw-24 && size > 11){
+      size--; ctx.font='bold '+size+'px "Trebuchet MS",Verdana,sans-serif';
+    }
+    txt(hint, hx+hw/2, H-42, size, '#ffe9b0', 'center', true);
+  }
+
+  /* Fortschritt: "x von 7 Pflege-Schritten" */
+  var dc = doneCount();
+  rr(18, H-114, 168, 26, 9); ctx.fillStyle='rgba(28,18,40,0.86)'; ctx.fill();
+  ctx.strokeStyle = dc===TASKS.length ? 'rgba(150,240,190,0.7)' : 'rgba(255,255,255,0.16)';
+  ctx.lineWidth=2; ctx.stroke();
+  txt(dc+' / '+TASKS.length+' Pflege-Schritte', 102, H-101, 13,
+      dc===TASKS.length ? '#9ff0bd' : '#e8dcff', 'center', true);
+
+  /* Auswahl-Hinweis */
+  if(selectedKind){
+    txt('👉 Tippe jetzt auf die Katze!', W/2, H-128, 17, '#fff', 'center', true);
+  }
+}
+
+function getHint(){
+  if(showTutorial || showWin) return '';
+  if(allDone()) return 'Fertig! Die Katze ist rundum gepflegt 🐱✨';
+  if(roomId==='bathroom'){
+    if(!cat.inTub && game.wash<1) return 'Ziehe die Katze in die Badewanne 🛁';
+    if(cat.inTub && game.wash<1) return 'Duschgel auf die Katze ziehen 🧴';
+    if(game.brush<1) return 'Fell kämmen 🪮';
+    if(game.claw<1) return 'Krallen kürzen ✂️';
+    if(game.teeth<1) return 'Zähne putzen 🪥';
+    return 'Im Bad ist alles erledigt ✔';
+  }
+  if(roomId==='living'){
+    if(game.feed<1) return 'Futter auf die Katze ziehen 🍗';
+    if(game.play<1) return 'Mit dem Spielball toben 🧶';
+    return 'Im Wohnzimmer ist alles erledigt ✔';
+  }
+  if(roomId==='bedroom'){
+    if(!sleeping) return 'Katze aufs Bett legen 😴';
+    if(game.nap<1) return 'Die schlafende Katze zudecken 💤';
+    return 'Im Schlafzimmer ist alles erledigt ✔';
+  }
+  return '';
+}
+
+/* ---------------- Overlays ---------------- */
+function panel(x,y,w,h){
+  ctx.save();
+  ctx.shadowColor='rgba(0,0,0,0.6)'; ctx.shadowBlur=30;
+  rr(x,y,w,h,26); ctx.fillStyle='rgba(30,20,44,0.95)'; ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle='rgba(255,209,102,0.6)'; ctx.lineWidth=3;
+  rr(x,y,w,h,26); ctx.stroke();
+}
+function drawTutorial(){
+  ctx.fillStyle='rgba(10,6,18,0.74)'; ctx.fillRect(0,0,W,H);
+  var x=110,y=54,w=740,h=546;
+  panel(x,y,w,h);
+  txt('🐱 Katzen-Schönheitssalon', W/2, y+48, 34, '#ffe9b0', 'center', true);
+  txt('Diese Katze braucht deine Hilfe – erledige 7 Pflege-Schritte!', W/2, y+88, 18, '#fff', 'center');
+
+  var col1 = [
+    'In der Badewanne mit Duschgel waschen',
+    'Das Fell mit dem Kamm kämmen',
+    'Die Krallen mit der Schere kürzen',
+    'Die Zähne mit der Zahnbürste putzen'
+  ];
+  var col2 = [
+    'Im Wohnzimmer mit Futter füttern',
+    'Mit dem Spielball austoben',
+    'Im Schlafzimmer aufs Bett legen',
+    'Die Katze streicheln (Bonus)'
+  ];
+  var y0 = y+128;
+  for(var i=0;i<col1.length;i++){
+    txt((i+1)+'.', x+30, y0+i*40, 15, '#ffd166', 'left', true);
+    txt(col1[i], x+52, y0+i*40, 15, '#f3ecff', 'left');
+  }
+  for(var j=0;j<col2.length;j++){
+    txt((j+5)+'.', x+382, y0+j*40, 15, '#ffd166', 'left', true);
+    txt(col2[j], x+404, y0+j*40, 15, '#f3ecff', 'left');
+  }
+
+  /* Räume-Legende */
+  var ry = y0 + 4*40 + 14;
+  rr(x+30, ry, w-60, 52, 12); ctx.fillStyle='rgba(255,255,255,0.07)'; ctx.fill();
+  txt('🛁 Bad:  Waschen · Kämmen · Krallen · Zähne', x+48, ry+17, 14, '#cfe8f5', 'left');
+  txt('🛋️ Wohnzimmer:  Füttern · Spielen          🛏️ Schlafzimmer:  Schlafen · Zudecken',
+      x+48, ry+37, 14, '#ffe1c9', 'left');
+
+  txt('Ziehen & ablegen – oder Teil antippen, dann die Katze antippen.',
+      W/2, y+432, 15, '#cbbde8', 'center');
+  txt('Tasten:  1 Bad   2 Wohnzimmer   3 Schlafzimmer   R Neustart   M Ton',
+      W/2, y+456, 14, '#9f92bd', 'center');
+
+  button('dismiss', W/2-130, y+478, 260, 52);
+  rr(W/2-130, y+478, 260, 52, 14);
+  ctx.fillStyle='#ffd166'; ctx.fill();
+  txt('Los geht\'s!', W/2, y+505, 22, '#3a2a12', 'center', true);
+}
+
+function drawWin(){
+  ctx.fillStyle='rgba(10,6,18,0.72)'; ctx.fillRect(0,0,W,H);
+  var x=220,y=74,w=520,h=470;
+  panel(x,y,w,h);
+  txt('🎉 Super gemacht! 🎉', W/2, y+48, 32, '#ffe9b0', 'center', true);
+  txt('Die Katze ist wunderschön und rundum gepflegt!', W/2, y+84, 17, '#fff', 'center');
+
+  /* Mini-Katze mit Krone */
+  ctx.save();
+  ctx.translate(W/2, y+196);
+  ctx.scale(0.58,0.58);
+  var saveX=cat.x, saveY=cat.y, saveSleep=sleeping;
+  cat.x=0; cat.y=0; sleeping=false;
+  drawCat(now);
+  cat.x=saveX; cat.y=saveY; sleeping=saveSleep;
+  ctx.restore();
+  ctx.fillStyle='#ffd166';
+  ctx.beginPath();
+  var kx=W/2, ky=y+196-118*0.58;
+  ctx.moveTo(kx-24,ky+14); ctx.lineTo(kx-18,ky-14); ctx.lineTo(kx-6,ky+2);
+  ctx.lineTo(kx,ky-18); ctx.lineTo(kx+6,ky+2); ctx.lineTo(kx+18,ky-14); ctx.lineTo(kx+24,ky+14);
+  ctx.closePath(); ctx.fill();
+
+  var secs = Math.max(1, Math.round((game.wonAt-game.startTime)/1000));
+  var stars = secs < 120 ? 3 : (secs < 240 ? 2 : 1);
+  for(var i=0;i<3;i++){
+    var sx = W/2-80+i*80, sy=y+272;
+    starPath(sx,sy,26,11,5);
+    ctx.fillStyle = i<stars ? '#ffe066' : 'rgba(255,255,255,0.18)'; ctx.fill();
+    ctx.strokeStyle = i<stars ? '#e0a800' : 'rgba(255,255,255,0.25)'; ctx.lineWidth=2; ctx.stroke();
+  }
+  txt('Zeit: '+Math.floor(secs/60)+':'+('0'+(secs%60)).slice(-2), W/2, y+312, 17, '#cbbde8', 'center');
+  txt('💖 '+game.hearts+' Streicheleinheiten   ·   '+TASKS.length+' / '+TASKS.length+' Pflege-Schritte',
+      W/2, y+338, 15, '#ffc7dd', 'center', true);
+
+  var byy = y+366, bh = 50;
+  button('restart', W/2-230, byy, 220, bh);
+  rr(W/2-230, byy, 220, bh, 14); ctx.fillStyle='rgba(255,255,255,0.14)'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.3)'; ctx.lineWidth=2; ctx.stroke();
+  txt('Weiter spielen', W/2-120, byy+bh/2+1, 19, '#fff', 'center', true);
+
+  button('again', W/2+10, byy, 220, bh);
+  rr(W/2+10, byy, 220, bh, 14); ctx.fillStyle='#ffd166'; ctx.fill();
+  txt('Nochmal spielen', W/2+120, byy+bh/2+1, 19, '#3a2a12', 'center', true);
+}
+
+/* ---------------- Eingabe ---------------- */
+function toGame(e){
+  var r = canvas.getBoundingClientRect();
+  return { x:(e.clientX-r.left)*(W/r.width), y:(e.clientY-r.top)*(H/r.height) };
+}
+function hit(b,p){ return p.x>=b.x && p.x<=b.x+b.w && p.y>=b.y && p.y<=b.y+b.h; }
+
+function handleButton(id){
+  if(id==='dismiss'){ showTutorial=false; game.startTime=now; tone(600,0.1,'sine',0.05,900); return; }
+  if(id==='mute'){ muted=!muted; if(!muted) tone(700,0.08,'sine',0.05); return; }
+  if(id==='restart'){ showWin=false; game.winAck=true; return; } /* Weiter spielen: nur Overlay schliessen */
+  if(id==='again'){ showWin=false; resetGame(); return; } /* Nochmal spielen: neu starten */
+  if(id.indexOf('room:')===0){ enterRoom(id.slice(5)); return; }
+}
+
+function resetGame(){
+  game.wash=0; game.brush=0; game.feed=0; game.claw=0;
+  game.teeth=0; game.play=0; game.nap=0;
+  game.fed=false; game.won=false; game.wonAt=0; game.winAck=false;
+  game.hearts=0; game.petCount=0;
+  game.particles.length=0;
+  game.startTime=now;
+  sleeping=false;
+  selectedKind=null;
+  showWin=false;
+  enterRoom('bathroom');
+  say('Neue Runde! Viel Spaß beim Verwöhnen. 🐱', 2.6);
+}
+
+function onDown(e){
+  e.preventDefault();
+  ensureAudio();
+  if(actx && actx.state==='suspended'){ try{ actx.resume(); }catch(err){} }
+  var p = toGame(e);
+  for(var i=uiButtons.length-1;i>=0;i--){
+    if(hit(uiButtons[i],p)){ handleButton(uiButtons[i].id); return; }
+  }
+  if(showTutorial || showWin) return;
+
+  /* Gegenstand? */
+  for(var k in items){
+    var it = items[k];
+    if(it.room !== roomId || it.carried) continue;
+    if(Math.abs(p.x-it.x) < 52 && Math.abs(p.y-it.y) < 46){
+      drag = { type:'item', kind:k, offx:p.x-it.x, offy:p.y-it.y,
+               startX:p.x, startY:p.y, moved:false };
+      it.carried = true;
+      return;
+    }
+  }
+
+  /* Katze? */
+  if(catHit(p)){
+    if(selectedKind){
+      var kk = selectedKind; selectedKind = null;
+      applyTool(kk);
+      return;
+    }
+    if(sleeping){
+      sleeping = false;
+      say('Mrrrow! Die Katze ist aufgewacht. 🐱', 2.4);
+      sfxMeow();
+      return;
+    }
+    drag = { type:'cat', offx:p.x-cat.x, offy:p.y-cat.y,
+             startX:p.x, startY:p.y, moved:false, petted:false };
+    cat.grabbed = true;
+    sfxPop();
+    return;
+  }
+
+  selectedKind = null;
+}
+
+function onMove(e){
+  if(!drag) return;
+  e.preventDefault();
+  var p = toGame(e);
+  if(drag.type==='item'){
+    var it = items[drag.kind];
+    it.x = p.x - drag.offx;
+    it.y = p.y - drag.offy;
+    if(Math.hypot(p.x-drag.startX, p.y-drag.startY) > 14) drag.moved = true;
+  } else if(drag.type==='cat'){
+    cat.x = p.x - drag.offx;
+    cat.y = p.y - drag.offy;
+    cat.tx = cat.x; cat.ty = cat.y;
+    if(Math.hypot(cat.x-drag.startX+p.x-cat.x, cat.y-drag.startY+p.y-cat.y) > 14) drag.moved = true;
+    if(Math.hypot(p.x-drag.startX, p.y-drag.startY) > 14) drag.moved = true;
+  }
+}
+
+function inTubZone(x,y){ return roomId==='bathroom' && x>560 && x<900 && y>380 && y<545; }
+function inBedZone(x,y){ return roomId==='bedroom' && x>118 && x<540 && y>330 && y<556; }
+
+function onUp(e){
+  if(!drag) return;
+  if(drag.type==='item'){
+    var it = items[drag.kind];
+    it.carried = false;
+    if(!drag.moved){
+      selectedKind = (selectedKind === drag.kind) ? null : drag.kind;
+      if(selectedKind) say('Super! Tippe jetzt auf die Katze. 👆', 2.4);
+    } else {
+      var d = Math.hypot(it.x-cat.x, it.y-(cat.y-60));
+      var reach = (drag.kind === 'pillow') ? 260 : 175;
+      if(d < reach){
+        applyTool(drag.kind);
+      } else if(sleeping){
+        say('Die Katze schläft. Wecke sie zum Pflegen zuerst! 😴', 2.4);
+      } else {
+        say('Nicht getroffen – ziehe das Teil direkt auf die Katze.', 2.2);
+      }
+    }
+    it.x = it.homeX; it.y = it.homeY;
+  }
+  else if(drag.type==='cat'){
+    cat.grabbed = false;
+    var moved = drag.moved;                 /* Bewegung wird in onMove erkannt */
+    if(moved){
+      if(inTubZone(cat.x, cat.y)){
+        cat.inTub = true;
+        cat.x = 720; cat.y = 472; cat.tx = 720; cat.ty = 472;
+        say('Platsch! Die Katze sitzt in der Badewanne. Nun Duschgel benutzen! 🫧', 3.0);
+        sfxPop();
+      } else {
+        cat.inTub = false;
+        if(inBedZone(cat.x, cat.y)){
+          cat.x = 300; cat.y = 470; cat.tx = 300; cat.ty = 470;
+          sleeping = true;
+          say('Die Katze schläft auf dem Bett. 😴 Jetzt mit dem Kissen zudecken!', 3.2);
+          tone(320,0.5,'sine',0.05,180);
+        }
+      }
+    } else {
+      /* nur angetippt, nicht gezogen -> streicheln */
+      petCat();
+    }
+  }
+  drag = null;
+}
+function onCancel(){ if(drag){ if(drag.type==='item'){ var it=items[drag.kind]; it.carried=false; it.x=it.homeX; it.y=it.homeY; } cat.grabbed=false; } drag=null; }
+
+canvas.addEventListener('pointerdown', onDown);
+window.addEventListener('pointermove', onMove);
+window.addEventListener('pointerup', onUp);
+window.addEventListener('pointercancel', onCancel);
+canvas.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+
+window.addEventListener('keydown', function(e){
+  var k = e.key.toLowerCase();
+  if(k==='escape'){ selectedKind=null; }
+  if(k==='1') enterRoom('bathroom');
+  if(k==='2') enterRoom('living');
+  if(k==='3') enterRoom('bedroom');
+  if(k==='r'){ resetGame(); }
+  if(k==='m'){ muted=!muted; }
+  if(k===' ' || k==='enter'){ if(showTutorial){ showTutorial=false; game.startTime=now; } }
+});
+
+/* ---------------- Hauptschleife ---------------- */
+var now = 0, last = 0;
+
+function update(dt){
+  now += dt;
+  if(msgTimer > 0) msgTimer -= dt;
+
+  /* Katze weich bewegen */
+  if(!cat.grabbed){
+    cat.x += (cat.tx - cat.x) * Math.min(1, dt*9);
+    cat.y += (cat.ty - cat.y) * Math.min(1, dt*9);
+  }
+  var moving = Math.hypot(cat.tx-cat.x, cat.ty-cat.y) > 1.5;
+  cat.walkT += dt * (moving ? 7 : 2.5);
+  cat.tail += dt * (game.fed ? 3.4 : 1.6);
+
+  /* Blinzeln */
+  cat.blinkTimer -= dt;
+  if(cat.blinkTimer <= 0){ cat.blinkTimer = 2 + Math.random()*3; cat.blink = 0.6; }
+  if(cat.blink > 0) cat.blink -= dt;
+
+  updateParticles(dt);
+
+  if(game.won && !showWin && !game.winAck && now - game.wonAt > 1.6) showWin = true;
+}
+
+function render(){
+  uiButtons = [];
+  var t = now;
+  ctx.clearRect(0,0,W,H);
+
+  drawRoom(t);
+  drawCat(t);
+  drawTubWaterOverlay();
+
+  for(var k in items){
+    var it = items[k];
+    if(it.room !== roomId || it.carried) continue;
+    var sel = (selectedKind === k);
+    if(sel){
+      ctx.save();
+      ctx.globalAlpha = 0.5 + Math.sin(t*4)*0.25;
+      circ(it.x, it.y+6, 42); ctx.strokeStyle='#ffd166'; ctx.lineWidth=4; ctx.stroke();
+      ctx.restore();
+    }
+    drawItemAt(k, it.x, it.y, t);
+    labelPill(it.label, it.x, it.y - 54);
+  }
+
+  if(drag && drag.type==='item'){
+    var di = items[drag.kind];
+    drawItemAt(drag.kind, di.x, di.y, t, true);
+  }
+
+  drawParticles();
+  drawHud(t);
+  if(showTutorial) drawTutorial();
+  if(showWin) drawWin();
+}
+
+function loop(ts){
+  var dt = last ? Math.min(0.05, (ts-last)/1000) : 0.016;
+  last = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+game.startTime = 0;
+now = 0;
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
